@@ -57,12 +57,17 @@ class DSQConv(nn.Conv2d):
         x = x - F.relu(x - upper)
 
         return x
+    
+    def floor_pass(self, x):
+        y = torch.floor(x) 
+        y_grad = x
+        return y.detach() - y_grad.detach() + y_grad
 
     def phi_function(self, x, mi, alpha, delta):
 
         # alpha should less than 2 or log will be None
         # alpha = alpha.clamp(None, 2)
-        alpha = torch.where(alpha >= 2.0, torch.tensor([2.0]).cuda(), alpha)
+        alpha = torch.where(alpha >= 2.0, torch.tensor([2.0], device = x.device), alpha)
         s = 1/(1-alpha)
         k = (2/alpha - 1).log() * (1/delta)
         x = (((x - mi) *k ).tanh()) * s 
@@ -95,7 +100,8 @@ class DSQConv(nn.Conv2d):
             cur_max = torch.max(Qweight)
             cur_min = torch.min(Qweight)
             delta =  (cur_max - cur_min)/(self.bit_range)
-            interval = (Qweight - cur_min) //delta            
+            #interval = (Qweight - cur_min) //delta ## not differential ??
+            interval = self.floor_pass((Qweight - cur_min) /delta)
             mi = (interval + 0.5) * delta + cur_min
             Qweight = self.phi_function(Qweight, mi, self.alphaW, delta)
             Qweight = self.sgn(Qweight)
@@ -117,7 +123,8 @@ class DSQConv(nn.Conv2d):
                 cur_max = torch.max(Qbias)
                 cur_min = torch.min(Qbias)
                 delta =  (cur_max - cur_min)/(self.bit_range)
-                interval = (Qbias - cur_min) //delta
+                #interval = (Qbias - cur_min) //delta
+                interval = self.floor_pass((Qbias - cur_min) /delta)
                 mi = (interval + 0.5) * delta + cur_min
                 Qbias = self.phi_function(Qbias, mi, self.alphaB, delta)
                 Qbias = self.sgn(Qbias)
@@ -138,7 +145,8 @@ class DSQConv(nn.Conv2d):
                 cur_max = torch.max(Qactivation)
                 cur_min = torch.min(Qactivation)
                 delta =  (cur_max - cur_min)/(self.bit_range)
-                interval = (Qactivation - cur_min) //delta
+                #interval = (Qactivation - cur_min) //delta
+                interval = self.floor_pass((Qactivation - cur_min) /delta)
                 mi = (interval + 0.5) * delta + cur_min                
                 Qactivation = self.phi_function(Qactivation, mi, self.alphaA, delta)
                 Qactivation = self.sgn(Qactivation)

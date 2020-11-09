@@ -17,7 +17,7 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
-
+from dataset import  Imagenet as Dataset
 
 
 from tensorboardX import SummaryWriter
@@ -49,7 +49,7 @@ parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=64, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -269,6 +269,8 @@ def main_worker(gpu, ngpus_per_node, args):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
     
+
+    '''
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
@@ -277,9 +279,18 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ToTensor(),
             normalize,
         ]))
+    '''
+    trans_train= transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    train_dataset = Dataset("train", trans_train)
     
-    
-
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     else:
@@ -289,14 +300,16 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir,
-            transforms.Compose([
+    trans_val = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
-        ])),
+        ])
+    val_dataset = Dataset('val', trans_val)
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
@@ -393,11 +406,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
-        target = target.cuda(args.gpu, non_blocking=True)
+        target = target.cuda(args.gpu, non_blocking=True).squeeze()
 
         # compute output
         output = model(images)
-        loss = criterion(output, target)
+        loss = criterion(output, target.squeeze())
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -465,7 +478,7 @@ def validate(val_loader, model, criterion, args, epoch):
 
             # compute output
             output = model(images)
-            loss = criterion(output, target)
+            loss = criterion(output, target.squeeze())
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -563,7 +576,7 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].contiguous().view(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
