@@ -42,14 +42,14 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     choices=model_names,
                     help='model architecture: ' +
                         ' | '.join(model_names) +
-                        ' (default: resnet18)')
+                        ' (default: resnet18)') 
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=64, type=int,
+parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -98,16 +98,21 @@ parser.add_argument('--quantize_input', dest='quantize_input', action='store_tru
 
 parser.add_argument('--quan_bit', default=8, type=int,
                     help='quantization bit num.')
-
-
+parser.add_argument("--local_rank", type=int, default=0, help="LOCAL_PROCESS_RANK")
+parser.add_argument("--multi-gpu", dest= "multi_gpu",default=False, action="store_true", help="muliti-gpu training")
 
 best_acc1 = 0
 
 
+def setup(rank, seed = -1):
+    dist.init_process_group(backend = "nccl",
+                            init_method= "env://")
+    torch.cuda.set_device(rank)
+    if seed > 0 :
+        torch.manual_seed(seed)
+
 def main():
     args = parser.parse_args()
-
-    
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -119,8 +124,9 @@ def main():
                       'You may see unexpected behavior when restarting '
                       'from checkpoints.')
 
-    global writer
-    writer = SummaryWriter(args.log_path)
+    if args.local_rank == 0:
+        global writer
+        writer = SummaryWriter(args.log_path)
 
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. This will completely '
@@ -130,7 +136,6 @@ def main():
         args.world_size = int(os.environ["WORLD_SIZE"])
 
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
-
     if args.quantize is not None:
     	assert args.quantize in ["uniform", "DSQ"]
 
@@ -142,6 +147,9 @@ def main():
         # Use torch.multiprocessing.spawn to launch distributed processes: the
         # main_worker process function
         mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+    if args.multi_gpu:
+        setup(args.local_rank, seed = args.seed if args.seed is not None else -1)
+        main_worker(args.gpu, ngpus_per_node, args)
     else:
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
@@ -221,6 +229,13 @@ def main_worker(gpu, ngpus_per_node, args):
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
+    if args.multi_gpu:
+        model = model.cuda()
+        model = torch.nn.parallel.DistributedDataParallel(model, 
+                                    device_ids= [args.local_rank], 
+                                    output_device = args.local_rank,
+                                    find_unused_parameters= True)
+        print('rank is :', args.local_rank)
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
@@ -293,6 +308,11 @@ def main_worker(gpu, ngpus_per_node, args):
     
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    elif args.multi_gpu:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,
+                                                            num_replicas = dist.get_world_size(),
+                                                            rank = args.local_rank
+        )
     else:
         train_sampler = None
 
@@ -301,6 +321,7 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     trans_val = transforms.Compose([
+            transforms.ToPILImage(),
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
@@ -319,24 +340,26 @@ def main_worker(gpu, ngpus_per_node, args):
     
     
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
+        if args.distributed or args.multi_gpu:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args)
 
-        # evaluate on validation set
-                  
+        # evaluate on validation set on master process
+        #if args.local_rank == 0:
         acc1 = validate(val_loader, model, criterion, args, epoch)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
-        writer.add_scalar("Best val Acc1", best_acc1, epoch)
+        if args.local_rank == 0:
+            writer.add_scalar("Best val Acc1", best_acc1, epoch)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
+        if not args.multiprocessing_distributed or \
+               (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0) or \
+               (args.local_rank == 0):
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
@@ -426,31 +449,32 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         # measure elapsed time
         batch_time.update(time.time() - end)
-        end = time.time()
+        end = time.time() 
 
         if i % args.print_freq == 0:
-            progress.display(i)
-            remain_epoch = args.epochs - epoch
-            remain_iters = remain_epoch * len(train_loader) + (len(train_loader) - i)
-            remain_seconds = remain_iters * batch_time.get_avg()
-            seconds = (remain_seconds//1) % 60
-            minutes = (remain_seconds//(1*60)) % 60
-            hours = (remain_seconds//(1*60*60)) % 24
-            days = (remain_seconds//(1*60*60*24))
-            time_stamp = ""            
-            if (days > 0): time_stamp += "{} days, ".format(days)
-            if (hours > 0) : time_stamp += "{} hr, ".format(hours)
-            if (minutes > 0) : time_stamp += "{} min, ".format(minutes)
-            if (seconds > 0) : time_stamp += "{} sec, ".format(seconds)            
-            print(">>>>>>>>>>>> Remaining Times: {}  <<<<<<<<<<<<<<<<<".format(time_stamp) )
+            if (args.gpu is not None) or (args.multi_gpu and args.local_rank == 0): 
+                progress.display(i)
+                remain_epoch = args.epochs - epoch
+                remain_iters = remain_epoch * len(train_loader) + (len(train_loader) - i)
+                remain_seconds = remain_iters * batch_time.get_avg()
+                seconds = (remain_seconds//1) % 60
+                minutes = (remain_seconds//(1*60)) % 60
+                hours = (remain_seconds//(1*60*60)) % 24
+                days = (remain_seconds//(1*60*60*24))
+                time_stamp = ""         
+                if (days > 0): time_stamp += "{} days, ".format(days)
+                if (hours > 0) : time_stamp += "{} hr, ".format(hours)
+                if (minutes > 0) : time_stamp += "{} min, ".format(minutes)
+                if (seconds > 0) : time_stamp += "{} sec, ".format(seconds)         
+                print(">>>>>>>>>>>> Remaining Times: {}  <<<<<<<<<<<<<<<<<".format(time_stamp) )
         # if i % 100 == 0:
         #     print("PPPPPPPPPPPPPPPPPPPPP")
         #     with torch.no_grad():
         #         log_alpha(model)
-
-    writer.add_scalar("Train Loss", loss.item(), epoch)
-    writer.add_scalar("Train Acc1", top1.avg, epoch)
-    writer.add_scalar("Train Acc5", top5.avg, epoch)
+    if args.local_rank == 0:
+        writer.add_scalar("Train Loss", loss.item(), epoch)
+        writer.add_scalar("Train Acc1", top1.avg, epoch)
+        writer.add_scalar("Train Acc5", top5.avg, epoch)
 
 
 def validate(val_loader, model, criterion, args, epoch):
@@ -468,7 +492,8 @@ def validate(val_loader, model, criterion, args, epoch):
     
     with torch.no_grad():
         # log alpha
-        log_alpha(model, epoch)
+        if args.local_rank == 0:
+            log_alpha(model, epoch)
         
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
@@ -492,14 +517,15 @@ def validate(val_loader, model, criterion, args, epoch):
 
             if i % args.print_freq == 0:
                 progress.display(i)
-                
+        
+        #if args.local_rank == 0:
         # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-              .format(top1=top1, top5=top5))
-
-        writer.add_scalar("Val Loss", loss.item(), epoch)
-        writer.add_scalar("Val Acc1", top1.avg, epoch)
-        writer.add_scalar("Val Acc5", top5.avg, epoch)
+            .format(top1=top1, top5=top5))
+        if args.local_rank == 0:
+            writer.add_scalar("Val Loss", loss.item(), epoch)
+            writer.add_scalar("Val Acc1", top1.avg, epoch)
+            writer.add_scalar("Val Acc5", top5.avg, epoch)
 
         
 

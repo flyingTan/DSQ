@@ -38,7 +38,7 @@ class Imagenet(Dataset):
             with open(self.nid_filename) as f:
                 for line in f:
                     nid, label, filename = line.strip().split("\t")
-                    filename = filename.split("/")[1]
+                    #filename = filename.split("/")[1]
                     #  lb = torch.LongTensor((int(label),))
                     lb = int(label)
                     self.targets.append(lb)
@@ -46,11 +46,12 @@ class Imagenet(Dataset):
         else:
             with open(self.nid_filename) as f:
                 for line in f:
-                    nid, label, _ = line.strip().split("\t")
+                    nid, label, filename = line.strip().split("\t")
+                    #filename = filename.split("/")[1]
                     # lb = torch.LongTensor((int(label),))
                     lb = int(label)
                     self.targets.append(lb)
-                    self.nid_labels.append((nid, lb, _))
+                    self.nid_labels.append((nid, lb, filename))
         return self
 
     def __getitem__(self, idx):
